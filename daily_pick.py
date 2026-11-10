@@ -20,6 +20,7 @@ daily_pick.py - سهم واحد يومياً من السوق الأمريكي + 
 أمثلة:
   python3 daily_pick.py download --data data/ --start 2023-01-01
   python3 daily_pick.py backtest --data data/ --year 2024 --capital-sar 100000
+  python3 daily_pick.py backtest --data data/ --year 2025 --hold 5 --top 5
   python3 daily_pick.py pick --data data/
 """
 import argparse
@@ -171,36 +172,62 @@ def compute_scores(frames, news=None, w_flow=0.4, w_mom=0.4, w_news=0.2):
 
 # ---------- الاختبار التاريخي ----------
 def backtest(frames, year, capital_usd, cost_pct=0.05, stop_pct=None,
-             min_score=0.0, news=None, compound=False):
+             min_score=0.0, news=None, compound=False, hold=1, top=1):
+    """
+    hold: عدد أيام الاحتفاظ (1 = شراء عند الافتتاح وبيع عند إغلاق اليوم نفسه).
+    top:  عدد الأسهم المشتراة معاً بأوزان متساوية (تنويع).
+    الشراء عند افتتاح أول يوم في الفترة والبيع عند إغلاق آخر يوم فيها،
+    والربح يُسجَّل يومياً حسب سعر الإغلاق.
+    """
     score = compute_scores(frames, news)
     opn = pd.DataFrame({t: f["open"] for t, f in frames.items()})
     low = pd.DataFrame({t: f["low"] for t, f in frames.items()})
     close = pd.DataFrame({t: f["close"] for t, f in frames.items()})
 
     dates = score.index
+    idx = [i for i in range(1, len(dates)) if dates[i].year == year]
     equity = capital_usd
+    cost = cost_pct / 100
     rows = []
-    for i in range(len(dates) - 1):
-        sig_day, trade_day = dates[i], dates[i + 1]
-        if trade_day.year != year:
-            continue
-        s = score.loc[sig_day].dropna()
-        if s.empty or s.max() < min_score:
-            rows.append(dict(date=trade_day, ticker="", pnl=0.0, ret=0.0, equity=equity))
-            continue
-        t = s.idxmax()
-        o, c, l = opn.at[trade_day, t], close.at[trade_day, t], low.at[trade_day, t]
-        if np.isnan(o) or np.isnan(c):
-            rows.append(dict(date=trade_day, ticker="", pnl=0.0, ret=0.0, equity=equity))
-            continue
-        exit_px = c
-        if stop_pct is not None and l <= o * (1 - stop_pct / 100):
-            exit_px = o * (1 - stop_pct / 100)
-        ret = exit_px / o - 1 - 2 * cost_pct / 100           # تكلفة دخول + خروج
+    for b in range(0, len(idx), hold):
+        block = idx[b:b + hold]
+        s = score.loc[dates[block[0] - 1]].dropna()      # إشارة اليوم السابق للشراء
+        s = s[s >= min_score].nlargest(top)
         base = equity if compound else capital_usd
-        pnl = base * ret
-        equity += pnl
-        rows.append(dict(date=trade_day, ticker=t, pnl=pnl, ret=ret, equity=equity))
+        # لكل سهم: سعر الدخول، آخر سعر تقييم، هل ما زال مفتوحاً
+        pos = {}
+        for t in s.index:
+            o = opn.at[dates[block[0]], t]
+            if not np.isnan(o):
+                pos[t] = dict(entry=o, prev=o, open=True)
+        label = "+".join(pos)
+        for k, i in enumerate(block):
+            day = dates[i]
+            ret = 0.0
+            for t, p in pos.items():
+                if not p["open"]:
+                    continue
+                o, c, l = opn.at[day, t], close.at[day, t], low.at[day, t]
+                if np.isnan(c):
+                    continue                              # لا تداول للسهم هذا اليوم
+                px, done = c, k == len(block) - 1
+                if stop_pct is not None:
+                    lvl = p["entry"] * (1 - stop_pct / 100)
+                    if k > 0 and o <= lvl:                # فجوة هبوط: الخروج عند الافتتاح
+                        px, done = o, True
+                    elif l <= lvl:
+                        px, done = lvl, True
+                r = (px - p["prev"]) / p["entry"]
+                if k == 0:
+                    r -= cost                             # تكلفة الدخول
+                if done:
+                    r -= cost                             # تكلفة الخروج
+                    p["open"] = False
+                p["prev"] = px
+                ret += r / top
+            pnl = base * ret
+            equity += pnl
+            rows.append(dict(date=day, ticker=label, pnl=pnl, ret=ret, equity=equity))
     return pd.DataFrame(rows)
 
 
@@ -258,6 +285,8 @@ def main():
     b.add_argument("--min-score", type=float, default=0.0)
     b.add_argument("--news", default=None)
     b.add_argument("--compound", action="store_true")
+    b.add_argument("--hold", type=int, default=1, help="أيام الاحتفاظ بالصفقة (5 = أسبوع)")
+    b.add_argument("--top", type=int, default=1, help="عدد الأسهم المشتراة معاً")
     b.add_argument("--out", default="trades.csv")
     k = sub.add_parser("pick")
     k.add_argument("--data", required=True)
@@ -281,7 +310,8 @@ def main():
         pick_today(frames, news)
         return
     cap = a.capital_sar / SAR_PER_USD
-    tr = backtest(frames, a.year, cap, a.cost, a.stop, a.min_score, news, a.compound)
+    tr = backtest(frames, a.year, cap, a.cost, a.stop, a.min_score, news, a.compound,
+                  max(1, a.hold), max(1, a.top))
     report(tr, cap, a.target)
     tr.to_csv(a.out, index=False)
     print(f"تفاصيل الصفقات: {a.out}")
