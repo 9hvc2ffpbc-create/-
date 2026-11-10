@@ -15,19 +15,97 @@ daily_pick.py - سهم واحد يومياً من السوق الأمريكي + 
   مجلد فيه ملف CSV لكل سهم، اسم الملف هو الرمز (مثل NVDA.csv)،
   والأعمدة: Date,Open,High,Low,Close,Volume
 
+  الأمر download ينزّل هذه الملفات تلقائياً من Yahoo Finance.
+
 أمثلة:
+  python3 daily_pick.py download --data data/ --start 2023-01-01
   python3 daily_pick.py backtest --data data/ --year 2024 --capital-sar 100000
   python3 daily_pick.py pick --data data/
 """
 import argparse
 import glob
+import json
 import os
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import numpy as np
 import pandas as pd
 
 SAR_PER_USD = 3.75
+
+# قائمة افتراضية: أسهم أمريكية كبيرة عالية السيولة
+DEFAULT_TICKERS = (
+    "AAPL MSFT NVDA AMZN GOOGL META TSLA AVGO AMD NFLX "
+    "JPM BAC GS V MA UNH LLY JNJ ABBV MRK "
+    "XOM CVX WMT COST HD MCD NKE DIS KO PEP "
+    "ORCL CRM ADBE INTC QCOM MU CSCO BA CAT UBER"
+).split()
+
+YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{}?{}"
+
+
+# ---------- تنزيل البيانات ----------
+def fetch_yahoo(ticker, start, end, retries=3):
+    """يعيد DataFrame بأعمدة Date,Open,High,Low,Close,Volume (جلسات مكتملة فقط)."""
+    q = urllib.parse.urlencode(dict(
+        period1=int(pd.Timestamp(start, tz="UTC").timestamp()),
+        period2=int((pd.Timestamp(end, tz="UTC") + pd.Timedelta(days=1)).timestamp()),
+        interval="1d", events="split"))
+    req = urllib.request.Request(YAHOO_URL.format(urllib.parse.quote(ticker), q),
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                res = json.load(r)["chart"]["result"][0]
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise ValueError("رمز غير معروف")
+            if attempt == retries - 1:
+                raise
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == retries - 1:
+                raise
+        time.sleep(2 ** (attempt + 1))
+    if not res.get("timestamp"):
+        raise ValueError("لا توجد بيانات")
+    q0 = res["indicators"]["quote"][0]
+    tz = res["meta"].get("exchangeTimezoneName", "America/New_York")
+    dates = (pd.to_datetime(res["timestamp"], unit="s", utc=True)
+             .tz_convert(tz).normalize().tz_localize(None))
+    df = pd.DataFrame(dict(Date=dates, Open=q0["open"], High=q0["high"], Low=q0["low"],
+                           Close=q0["close"], Volume=q0["volume"])).dropna()
+    # استبعاد جلسة اليوم إن لم تُغلق بعد، حتى لا يُبنى القرار على شمعة ناقصة
+    reg_end = res["meta"].get("currentTradingPeriod", {}).get("regular", {}).get("end")
+    if reg_end and time.time() < reg_end and len(df):
+        today = pd.Timestamp(reg_end, unit="s", tz="UTC").tz_convert(tz).normalize().tz_localize(None)
+        df = df[df["Date"] < today]
+    return df.drop_duplicates("Date")
+
+
+def download(folder, tickers, start, end):
+    os.makedirs(folder, exist_ok=True)
+    ok = 0
+    for t in tickers:
+        try:
+            df = fetch_yahoo(t, start, end)
+        except Exception as e:  # رمز واحد فاشل لا يوقف الباقي
+            print(f"  {t:<6} فشل: {e}", file=sys.stderr)
+            continue
+        if df.empty:
+            print(f"  {t:<6} فشل: لا توجد بيانات", file=sys.stderr)
+            continue
+        df.to_csv(os.path.join(folder, f"{t}.csv"), index=False, date_format="%Y-%m-%d")
+        ok += 1
+        print(f"  {t:<6} {len(df):>5} يوماً  {df['Date'].iloc[0]:%Y-%m-%d} -> {df['Date'].iloc[-1]:%Y-%m-%d}")
+        time.sleep(0.2)
+    print(f"تم تنزيل {ok} من {len(tickers)} سهماً إلى {folder}")
+    if not ok:
+        sys.exit(1)
 
 
 # ---------- تحميل البيانات ----------
@@ -184,7 +262,18 @@ def main():
     k = sub.add_parser("pick")
     k.add_argument("--data", required=True)
     k.add_argument("--news", default=None)
+    d = sub.add_parser("download", help="تنزيل الأسعار اليومية من Yahoo Finance")
+    d.add_argument("--data", required=True, help="مجلد الحفظ")
+    d.add_argument("--tickers", default=None, help="رموز مفصولة بفواصل (الافتراضي: 40 سهماً كبيراً)")
+    d.add_argument("--start", default="2023-01-01")
+    d.add_argument("--end", default=None, help="الافتراضي: اليوم")
     a = p.parse_args()
+
+    if a.cmd == "download":
+        tickers = ([t.strip().upper() for t in a.tickers.split(",") if t.strip()]
+                   if a.tickers else DEFAULT_TICKERS)
+        download(a.data, tickers, a.start, a.end or pd.Timestamp.now().strftime("%Y-%m-%d"))
+        return
 
     frames = load_data(a.data)
     news = load_news(a.news)
